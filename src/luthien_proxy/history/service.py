@@ -431,12 +431,16 @@ def _build_session_filter_sql(
         )
 
     if search.from_time is not None:
-        placeholder = add_param(search.from_time if db_pool.is_postgres else search.from_time.isoformat())
-        having.append(f"MAX(ce.created_at) >= {placeholder}")
+        if db_pool.is_postgres:
+            having.append(f"MAX(ce.created_at) >= {add_param(search.from_time)}")
+        else:
+            having.append(f"datetime(MAX(ce.created_at)) >= datetime({add_param(search.from_time.isoformat(' '))})")
 
     if search.to_time is not None:
-        placeholder = add_param(search.to_time if db_pool.is_postgres else search.to_time.isoformat())
-        having.append(f"MAX(ce.created_at) <= {placeholder}")
+        if db_pool.is_postgres:
+            having.append(f"MAX(ce.created_at) <= {add_param(search.to_time)}")
+        else:
+            having.append(f"datetime(MAX(ce.created_at)) <= datetime({add_param(search.to_time.isoformat(' '))})")
 
     if search.policy_intervention:
         having.append(f"{_intervention_count_expr(db_pool.is_postgres)} > 0")

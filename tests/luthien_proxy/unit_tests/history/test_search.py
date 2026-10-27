@@ -257,6 +257,24 @@ class TestTimeRangeFilter:
         assert [s.session_id for s in result.sessions] == ["s-new"]
 
     @pytest.mark.asyncio
+    async def test_sqlite_filter_matches_production_timestamp_format(self, sqlite_pool: DatabasePool):
+        """created_at is stored by sqlite3's datetime adapter as a space-separated string
+        with a UTC offset; a same-day event must still match a date-level bound.
+
+        Regression for the off-by-a-day bug: the old bind used a 'T' separator,
+        which sorts after a space, so a same-day row fell outside the range.
+        """
+        await _seed_request(sqlite_pool, call_id="c1", session_id="s1", created_at="2026-04-01 10:00:00.123456+00:00")
+        from_same_day = await fetch_session_list(
+            limit=10, db_pool=sqlite_pool, search=SessionSearchParams(from_time=datetime(2026, 4, 1, 0, 0, 0))
+        )
+        to_same_day = await fetch_session_list(
+            limit=10, db_pool=sqlite_pool, search=SessionSearchParams(to_time=datetime(2026, 4, 1, 23, 59, 59))
+        )
+        assert [s.session_id for s in from_same_day.sessions] == ["s1"]
+        assert [s.session_id for s in to_same_day.sessions] == ["s1"]
+
+    @pytest.mark.asyncio
     async def test_bounds_are_inclusive_at_exact_timestamp(self, sqlite_pool: DatabasePool):
         """A session whose last activity equals from_time or to_time exactly is included."""
         await _seed_request(sqlite_pool, call_id="c1", session_id="s1", created_at="2026-04-01T10:00:00")
@@ -558,7 +576,7 @@ class TestBuildSessionFilterSql:
         _build_session_filter_sql(
             SessionSearchParams(from_time=dt, to_time=dt), _FakePool(is_postgres=False), sqlite_args
         )
-        assert sqlite_args == [dt.isoformat(), dt.isoformat()]
+        assert sqlite_args == [dt.isoformat(" "), dt.isoformat(" ")]
 
     def test_user_scope_sql_appended_to_gate_subqueries(self):
         args: list = []

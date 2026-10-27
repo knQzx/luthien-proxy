@@ -52,6 +52,11 @@ _FORWARDING_HEADERS = (
     "x-forwarded-host",
     "x-forwarded-proto",
     "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "fastly-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
 )
 
 

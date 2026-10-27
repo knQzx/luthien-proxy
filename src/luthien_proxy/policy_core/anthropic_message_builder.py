@@ -48,6 +48,7 @@ from anthropic.types import (
     RawMessageDeltaEvent,
     TextBlock,
     TextDelta,
+    ThinkingDelta,
     ToolUseBlock,
 )
 
@@ -135,6 +136,20 @@ class _BufferedTextBlock:
 
 
 @dataclass
+class BufferedThinking:
+    """Upstream thinking block held back from the wire until it is judged.
+
+    The original start and delta events are kept verbatim so a judged-pass
+    block is re-emitted with its ``signature`` intact; ``text`` is the
+    accumulated reasoning the judge sees.
+    """
+
+    start_event: RawContentBlockStartEvent
+    deltas: list[RawContentBlockDeltaEvent] = field(default_factory=list)
+    text: str = ""
+
+
+@dataclass
 class BufferedTool:
     """Upstream tool_use block accumulated from streaming deltas.
 
@@ -156,6 +171,7 @@ class BufferedTool:
 class _BuilderState:
     # Upstream buffering: deltas accumulate here before being judged.
     text_buffer: dict[int, _BufferedTextBlock] = field(default_factory=dict)
+    thinking_buffer: dict[int, BufferedThinking] = field(default_factory=dict)
     tool_buffer: dict[int, BufferedTool] = field(default_factory=dict)
     # Downstream composition: where committed/queued content lives until flush.
     committed_descriptors: list[BlockDescriptor] = field(default_factory=list)
@@ -230,6 +246,44 @@ class AnthropicMessageBuilder:
         """
         buffered = self._state.text_buffer.pop(index, None)
         return buffered.text if buffered is not None else None
+
+    def begin_thinking_buffer(self, index: int, start_event: RawContentBlockStartEvent) -> None:
+        """Hold a thinking block back from the wire until it is judged.
+
+        Caller suppresses the start event; the original start and deltas are
+        replayed at commit time so the signature survives.
+        """
+        self._state.thinking_buffer[index] = BufferedThinking(start_event=start_event)
+
+    def append_thinking_delta(self, index: int, event: RawContentBlockDeltaEvent) -> bool:
+        """Buffer a thinking/signature delta at this index.
+
+        Returns True if buffered, False if no thinking buffer exists there
+        (caller should treat as passthrough).
+        """
+        buffered = self._state.thinking_buffer.get(index)
+        if buffered is None:
+            return False
+        buffered.deltas.append(event)
+        if isinstance(event.delta, ThinkingDelta):
+            buffered.text += event.delta.thinking
+        return True
+
+    def take_thinking(self, index: int) -> "BufferedThinking | None":
+        """Pop the buffered thinking block at this index."""
+        return self._state.thinking_buffer.pop(index, None)
+
+    def commit_thinking(self, buffered: "BufferedThinking") -> list[MessageStreamEvent]:
+        """Re-emit a judged-pass thinking block verbatim, with a rewritten index."""
+        index = self._allocate_index()
+        block_type = getattr(buffered.start_event.content_block, "type", "thinking") or "thinking"
+        self._state.committed_descriptors.append(BlockDescriptor(type=block_type, content=""))
+        events: list[MessageStreamEvent] = [
+            cast(MessageStreamEvent, buffered.start_event.model_copy(update={"index": index}))
+        ]
+        events.extend(cast(MessageStreamEvent, d.model_copy(update={"index": index})) for d in buffered.deltas)
+        events.append(cast(MessageStreamEvent, RawContentBlockStopEvent(type="content_block_stop", index=index)))
+        return events
 
     def begin_tool_buffer(self, index: int, *, id: str, name: str) -> None:
         """Record that an upstream tool_use block is starting at this index."""
@@ -608,6 +662,7 @@ def parse_tool_input(input_json: str) -> "JSONObject":
 
 __all__ = [
     "AnthropicMessageBuilder",
+    "BufferedThinking",
     "BufferedTool",
     "ToolBlockHandler",
     "ToolStopHandler",

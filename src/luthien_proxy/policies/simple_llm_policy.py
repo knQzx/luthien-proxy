@@ -56,6 +56,7 @@ from luthien_proxy.policy_core import (
 )
 from luthien_proxy.policy_core.anthropic_message_builder import (
     AnthropicMessageBuilder,
+    BufferedThinking,
     BufferedTool,
 )
 from luthien_proxy.policy_core.judge_orchestrator import Bailed, JudgeOrchestrator
@@ -366,7 +367,11 @@ class SimpleLLMPolicy(BasePolicy, AnthropicHookPolicy):
             builder.begin_text_buffer(event.index)
             return []
 
-        # Passthrough (thinking, redacted_thinking, future block types).
+        if hasattr(cb, "type") and cb.type == "thinking":
+            builder.begin_thinking_buffer(event.index, event)
+            return []
+
+        # Passthrough (redacted_thinking has no readable text to judge, future block types).
         return builder.passthrough_start(event)
 
     def _handle_block_delta(
@@ -378,6 +383,8 @@ class SimpleLLMPolicy(BasePolicy, AnthropicHookPolicy):
         if isinstance(delta, TextDelta) and builder.append_text_delta(event.index, delta.text):
             return []
         if isinstance(delta, InputJSONDelta) and builder.append_tool_delta(event.index, delta.partial_json):
+            return []
+        if builder.append_thinking_delta(event.index, event):
             return []
 
         return builder.passthrough_delta(event)
@@ -395,6 +402,10 @@ class SimpleLLMPolicy(BasePolicy, AnthropicHookPolicy):
         tool = builder.take_tool(event.index)
         if tool is not None:
             return await self._handle_tool_stop(state, tool, context)
+
+        thinking = builder.take_thinking(event.index)
+        if thinking is not None:
+            return await self._handle_thinking_stop(state, thinking, context)
 
         return builder.passthrough_stop(event)
 
@@ -418,6 +429,23 @@ class SimpleLLMPolicy(BasePolicy, AnthropicHookPolicy):
         if action.action == "replace":
             return self._apply_replacement_to_builder(state.builder, action)
         return []  # blocked text — suppress
+
+    async def _handle_thinking_stop(
+        self,
+        state: _SimpleLLMAnthropicState,
+        thinking: BufferedThinking,
+        context: "PolicyContext",
+    ) -> list[MessageStreamEvent]:
+        descriptor = BlockDescriptor(type="thinking", content=thinking.text)
+        action = await self._judge_block(descriptor, state.builder.committed_descriptors, context)
+        if action.judge_failed:
+            state.judge_error_occurred = True
+
+        if action.action == "pass":
+            return state.builder.commit_thinking(thinking)
+        # Blocked or replace: drop the block. Rewriting reasoning text would
+        # invalidate its signature, so a non-pass verdict suppresses it.
+        return []
 
     async def _handle_tool_stop(
         self,
